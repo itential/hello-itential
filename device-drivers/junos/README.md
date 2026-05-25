@@ -36,6 +36,52 @@ The script writes a single JSON object to stdout and exits non-zero on
 failure. From an Itential workflow task, bind the response to a variable
 and evaluate the `success` and per-action fields directly.
 
+## Candidate datastore locking (send-command)
+
+`send-command` takes an exclusive lock on the candidate datastore before
+loading config — NETCONF requires this and it prevents two operators (or
+two automations) from committing conflicting changes. If another session
+already holds the lock, the default behavior is a 30-second wait with
+2-second polling before failing. Tunables:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--lock-timeout` | `30` | Max seconds to wait. `0` = fail immediately. |
+| `--lock-poll-interval` | `2.0` | Seconds between retries. |
+
+The successful response includes `lock_wait_seconds` so you can see how
+long the operation actually blocked. Only `lock-denied` / `in-use` errors
+are retried — any other RPC failure short-circuits the wait immediately.
+
+## Recommended inventory attributes per device
+
+For devices that should use this driver, set these in Inventory Manager
+alongside (or replacing) your netmiko/scrapli attributes. The workflow
+task that calls `junos-netconf` reads these and maps them to the script's
+flags.
+
+```json
+{
+  "name": "aws-lab-junos",
+  "attributes": {
+    "itential_host": "10.0.16.8",
+    "itential_user": "itential",
+    "itential_password": "$SECRET_vault $KEY_junos_pass",
+    "itential_netconf_port": 830,
+    "itential_netconf_timeout": 30,
+    "itential_netconf_lock_timeout": 60,
+    "itential_netconf_lock_poll_interval": 2
+  }
+}
+```
+
+The `itential_netconf_*` attributes are read by the workflow author and
+passed to the script as `--port`, `--timeout`, `--lock-timeout`,
+`--lock-poll-interval`. For devices that are mostly read-only or unlikely
+to have contended locks, `itential_netconf_lock_timeout: 0` (fail-fast)
+is reasonable. For shared lab devices where multiple operators may be
+poking at the candidate, `60` or higher is sane.
+
 ## Why NETCONF for destructive ops
 
 `request system software add` and `request system reboot` invoke device

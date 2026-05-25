@@ -12,6 +12,7 @@ Actions: is-alive, run-command, get-config, send-command, reboot
 import argparse
 import json
 import sys
+import time
 
 from ncclient import manager
 from ncclient.operations.rpc import RPCError
@@ -73,15 +74,37 @@ def get_config(args) -> dict:
         return {"success": False, "host": args.host, "error": str(e), "error_type": type(e).__name__}
 
 
+def _acquire_candidate_lock(m, timeout: int, poll_interval: float) -> float:
+    """Lock the candidate datastore, retrying on lock-denied up to `timeout` seconds.
+
+    Returns elapsed seconds waited. Raises the last RPCError if timeout expires.
+    The retry only catches lock-denied / in-use errors; other RPC failures bubble
+    immediately so a misconfigured device doesn't silently consume the timeout.
+    """
+    deadline = time.monotonic() + max(timeout, 0)
+    start = time.monotonic()
+    while True:
+        try:
+            m.lock(target="candidate")
+            return time.monotonic() - start
+        except RPCError as e:
+            msg = str(e).lower()
+            transient = "lock-denied" in msg or "lock denied" in msg or "in-use" in msg or "in use" in msg
+            if not transient or timeout == 0 or time.monotonic() >= deadline:
+                raise
+            time.sleep(poll_interval)
+
+
 def send_command(args) -> dict:
     """Apply Junos 'set ...' style config and commit.
 
-    args.command is a list of set commands. Locks candidate, loads with
-    action='set' format='text', commits, unlocks. Rolls back on failure.
+    args.command is a list of set commands. Locks candidate (with retry up to
+    --lock-timeout), loads with action='set' format='text', commits, unlocks.
+    Rolls back on failure.
     """
     try:
         with _connect(args.host, args.port, args.user, args.password, timeout=args.timeout) as m:
-            m.lock(target="candidate")
+            lock_wait = _acquire_candidate_lock(m, args.lock_timeout, args.lock_poll_interval)
             try:
                 config_text = "\n".join(args.command)
                 m.load_configuration(action="set", config=config_text)
@@ -90,6 +113,7 @@ def send_command(args) -> dict:
                     "success": True,
                     "host": args.host,
                     "commands": args.command,
+                    "lock_wait_seconds": round(lock_wait, 2),
                     "commit": commit_reply.xml,
                 }
             except Exception as inner:
@@ -160,6 +184,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_send = sub.add_parser("send-command", help="Apply Junos set-style config and commit")
     _add_conn_args(p_send)
     p_send.add_argument("--command", action="append", required=True, help="set-style config line (repeatable)")
+    p_send.add_argument(
+        "--lock-timeout",
+        type=int,
+        default=30,
+        help="Max seconds to wait for the candidate datastore lock (default 30, 0 = no wait)",
+    )
+    p_send.add_argument(
+        "--lock-poll-interval",
+        type=float,
+        default=2.0,
+        help="Seconds between lock retries (default 2)",
+    )
 
     p_reboot = sub.add_parser("reboot", help="Schedule a reboot via <request-reboot/> RPC")
     _add_conn_args(p_reboot)
